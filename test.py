@@ -4,10 +4,10 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout,
     QScrollArea, QWidget, QComboBox, QLineEdit, QPushButton, QHBoxLayout, QMessageBox,
-    QMenu
+    QMenu, QInputDialog
 )
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen
-from PyQt5.QtCore import Qt, QRect
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QCursor
+from PyQt5.QtCore import Qt, QRect, QTimer
 
 # -------- 图像模式处理函数 --------
 def invert_rgb(arr):
@@ -32,22 +32,24 @@ def fitz_pix_to_qimage(pix, mode="default"):
     qimg = QImage(img.data, pix.width, pix.height, pix.width*3, QImage.Format_RGB888)
     return qimg.copy()  # 必须copy
 
-# -------- 支持鼠标选区和高亮的页面控件 --------
+# 支持多色高亮+批注的页面控件，及鼠标高亮提示
 class SelectablePDFPage(QLabel):
-    def __init__(self, page, qimg, parent=None):
+    def __init__(self, page, qimg, page_idx, highlight_colors, parent=None):
         super().__init__(parent)
-        self.page = page            # PyMuPDF page对象
-        self.base_qimg = qimg       # 当前显示的QImage（已模式变换）
+        self.page = page
+        self.base_qimg = qimg
+        self.page_idx = page_idx
         self.setPixmap(QPixmap.fromImage(self.base_qimg))
         self.setAlignment(Qt.AlignCenter)
-        self.selection_rect = None  # 当前选区
-        self.highlights = []        # [QRect, ...]，每个为高亮区域
+        self.selection_rect = None
+        self.highlights = []  # 每项: {'rect': QRect, 'color': QColor, 'note': str}
         self.selecting = False
         self.start_pos = None
         self.end_pos = None
         self.setMouseTracking(True)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.context_menu)
+        self.highlight_colors = highlight_colors
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -63,6 +65,15 @@ class SelectablePDFPage(QLabel):
             self.end_pos = event.pos()
             self.selection_rect = QRect(self.start_pos, self.end_pos).normalized()
             self.update()
+        else:
+            # 悬停显示批注
+            tip = ""
+            for h in self.highlights:
+                if h['rect'].contains(event.pos()):
+                    if h['note']:
+                        tip = f"{h['note']}"
+                    break
+            self.setToolTip(tip)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -76,10 +87,22 @@ class SelectablePDFPage(QLabel):
     def context_menu(self, pos):
         if self.selection_rect and self.selection_rect.width() > 5 and self.selection_rect.height() > 5:
             menu = QMenu(self)
-            act_highlight = menu.addAction("高亮所选内容")
+            color_actions = []
+            for name, color in self.highlight_colors:
+                act = menu.addAction(f"高亮：{name}")
+                color_actions.append((act, color))
+            act_cancel = menu.addAction("取消")
             action = menu.exec_(self.mapToGlobal(pos))
-            if action == act_highlight:
-                self.highlights.append(self.selection_rect)
+            if action != act_cancel and action is not None:
+                # 弹窗输入批注
+                note, ok = QInputDialog.getText(self, "输入批注", "为高亮内容添加批注（可选）：")
+                idx = [a for a, _ in color_actions].index(action)
+                color = color_actions[idx][1]
+                self.highlights.append({
+                    'rect': QRect(self.selection_rect),
+                    'color': QColor(*color, 80),
+                    'note': note if ok and note else "",
+                })
                 self.selection_rect = None
                 self.update()
 
@@ -87,17 +110,14 @@ class SelectablePDFPage(QLabel):
         painter = QPainter(self)
         painter.drawPixmap(0, 0, QPixmap.fromImage(self.base_qimg))
         painter.setRenderHint(QPainter.Antialiasing)
-        # 所有高亮
-        for rect in self.highlights:
-            painter.fillRect(rect, QColor(255, 255, 0, 80))  # 半透明黄
-        # 当前选区
+        for h in self.highlights:
+            painter.fillRect(h['rect'], h['color'])
         if self.selection_rect:
             painter.setPen(QPen(Qt.red, 2, Qt.DashLine))
             painter.drawRect(self.selection_rect)
         painter.end()
 
     def get_selected_text(self):
-        """返回当前选区内的PDF文本（用像素选区映射到PDF坐标）。"""
         if not self.selection_rect or self.selection_rect.width() < 5 or self.selection_rect.height() < 5:
             return ""
         qimg_w, qimg_h = self.base_qimg.width(), self.base_qimg.height()
@@ -113,16 +133,27 @@ class SelectablePDFPage(QLabel):
         selected_words = [w[4] for w in words if fitz.Rect(w[:4]).intersects(select_box)]
         return " ".join(selected_words)
 
-# -------- 主窗口 --------
-class ContinuousPDFViewer(QMainWindow):
+# 懒加载连续PDF主窗口
+class LazyPDFViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyQt 连续滚动PDF高亮阅读器")
+        self.setWindowTitle("PyQt 连续滚动PDF高亮+懒加载阅读器")
         self.resize(1000, 800)
         self.pdf_doc = None
-        self.page_imgs = []
-        self.current_mode = "default"
+        self.loaded_pages = {}   # idx: SelectablePDFPage
+        self.current_mode = "默认"
         self.current_viewport_width = 0
+        self.visible_range = (0, 0)
+        self.max_pages_mem = 10  # 同时最多缓存的页面数（可按机器内存调大）
+        self.page_height_hint = 800
+        # 多色高亮
+        self.highlight_colors = [
+            ("黄色", (255, 255, 0)),
+            ("绿色", (0, 255, 100)),
+            ("蓝色",  (30, 160, 255)),
+            ("粉色",  (255, 160, 255)),
+            ("橙色",  (255, 180, 40)),
+        ]
 
         widget = QWidget()
         vbox = QVBoxLayout(widget)
@@ -131,7 +162,7 @@ class ContinuousPDFViewer(QMainWindow):
         open_btn.clicked.connect(self.open_pdf)
         self.mode_box = QComboBox()
         self.mode_box.addItems(["默认", "夜间", "护眼"])
-        self.mode_box.currentIndexChanged.connect(self.update_pages)
+        self.mode_box.currentIndexChanged.connect(self.reload_pages)
         self.page_edit = QLineEdit()
         self.page_edit.setPlaceholderText("跳转页码")
         self.jump_btn = QPushButton("跳转")
@@ -157,13 +188,36 @@ class ContinuousPDFViewer(QMainWindow):
         vbox.addWidget(self.scroll)
         self.setCentralWidget(widget)
 
+        # 滚动懒加载
+        self.scroll.verticalScrollBar().valueChanged.connect(self.on_scroll)
+        self.scroll_timer = QTimer(self)
+        self.scroll_timer.setSingleShot(True)
+        self.scroll_timer.timeout.connect(self.check_visible_pages)
+
     def open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择PDF", "", "PDF Files (*.pdf)")
         if not path:
             return
         self.pdf_doc = fitz.open(path)
         self.page_info.setText(f"共 {self.pdf_doc.page_count} 页")
-        self.update_pages()
+        self.loaded_pages.clear()
+        for i in reversed(range(self.inner_layout.count())):
+            widget = self.inner_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+        # 预估每页高度
+        first_page = self.pdf_doc.load_page(0)
+        zoom = self.get_dynamic_zoom()
+        mat = fitz.Matrix(zoom, zoom)
+        pix = first_page.get_pixmap(matrix=mat, alpha=False)
+        self.page_height_hint = pix.height + 16
+        # 填充布局占位
+        for i in range(self.pdf_doc.page_count):
+            ph = QLabel()
+            ph.setMinimumHeight(self.page_height_hint)
+            self.inner_layout.addWidget(ph)
+        self.reload_pages()
+        QTimer.singleShot(100, self.check_visible_pages)
 
     def get_dynamic_zoom(self):
         if not self.pdf_doc:
@@ -175,29 +229,64 @@ class ContinuousPDFViewer(QMainWindow):
         zoom = view_w / pdf_w * 0.98
         return zoom
 
-    def update_pages(self):
-        for i in reversed(range(self.inner_layout.count())):
-            widget = self.inner_layout.itemAt(i).widget()
-            if widget:
-                widget.setParent(None)
-        self.page_imgs = []
+    def reload_pages(self):
+        self.loaded_pages.clear()
+        self.check_visible_pages()
+
+    def on_scroll(self):
+        # 滚动时避免频繁重渲染，做延迟
+        self.scroll_timer.start(50)
+
+    def check_visible_pages(self):
         if not self.pdf_doc:
             return
+        bar = self.scroll.verticalScrollBar()
+        y0 = bar.value()
+        y1 = y0 + self.scroll.viewport().height()
+        # 估算当前可见页idx范围
+        p_start = max(int(y0 // self.page_height_hint) - 2, 0)
+        p_end = min(int(y1 // self.page_height_hint) + 2, self.pdf_doc.page_count - 1)
+        # 加载/销毁
+        for i in range(self.pdf_doc.page_count):
+            item = self.inner_layout.itemAt(i)
+            if p_start <= i <= p_end:
+                if i not in self.loaded_pages:
+                    self.load_page(i)
+            else:
+                if i in self.loaded_pages:
+                    w = self.loaded_pages.pop(i)
+                    w.setParent(None)
+                    ph = QLabel()
+                    ph.setMinimumHeight(self.page_height_hint)
+                    self.inner_layout.insertWidget(i, ph)
+        # 控制最大页面缓存
+        while len(self.loaded_pages) > self.max_pages_mem:
+            farthest = max(self.loaded_pages, key=lambda idx: abs((p_start+p_end)//2-idx))
+            w = self.loaded_pages.pop(farthest)
+            w.setParent(None)
+            ph = QLabel()
+            ph.setMinimumHeight(self.page_height_hint)
+            self.inner_layout.insertWidget(farthest, ph)
+
+    def load_page(self, idx):
+        page = self.pdf_doc.load_page(idx)
         mode = self.mode_box.currentText()
         zoom = self.get_dynamic_zoom()
-        for i, page in enumerate(self.pdf_doc):
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            if mode == "夜间":
-                qimg = fitz_pix_to_qimage(pix, "night")
-            elif mode == "护眼":
-                qimg = fitz_pix_to_qimage(pix, "eye")
-            else:
-                qimg = fitz_pix_to_qimage(pix, "default")
-            label = SelectablePDFPage(page, qimg)
-            self.inner_layout.addWidget(label)
-            self.page_imgs.append(label)
-        self.page_info.setText(f"共 {self.pdf_doc.page_count} 页")
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        if mode == "夜间":
+            qimg = fitz_pix_to_qimage(pix, "night")
+        elif mode == "护眼":
+            qimg = fitz_pix_to_qimage(pix, "eye")
+        else:
+            qimg = fitz_pix_to_qimage(pix, "default")
+        label = SelectablePDFPage(page, qimg, idx, self.highlight_colors)
+        label.setMinimumHeight(self.page_height_hint)
+        self.inner_layout.insertWidget(idx, label)
+        ph = self.inner_layout.itemAt(idx+1).widget()
+        if isinstance(ph, QLabel) and ph is not label:
+            ph.setParent(None)
+        self.loaded_pages[idx] = label
 
     def jump_page(self):
         if not self.pdf_doc:
@@ -207,7 +296,10 @@ class ContinuousPDFViewer(QMainWindow):
             if not (0 <= p < self.pdf_doc.page_count):
                 QMessageBox.warning(self, "提示", "页码超出范围")
                 return
-            label = self.page_imgs[p]
+            label = self.loaded_pages.get(p)
+            if not label:
+                self.load_page(p)
+                label = self.loaded_pages[p]
             self.scroll.ensureWidgetVisible(label)
         except:
             pass
@@ -217,10 +309,10 @@ class ContinuousPDFViewer(QMainWindow):
         new_width = self.scroll.viewport().width()
         if new_width != self.current_viewport_width:
             self.current_viewport_width = new_width
-            self.update_pages()
+            self.reload_pages()
 
     def copy_selected_text(self):
-        for label in self.page_imgs:
+        for label in self.loaded_pages.values():
             text = label.get_selected_text()
             if text:
                 QApplication.clipboard().setText(text)
@@ -230,6 +322,6 @@ class ContinuousPDFViewer(QMainWindow):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    viewer = ContinuousPDFViewer()
+    viewer = LazyPDFViewer()
     viewer.show()
     sys.exit(app.exec_())
