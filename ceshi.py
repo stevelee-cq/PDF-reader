@@ -1,140 +1,147 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
+import sys
 import fitz  # PyMuPDF
-import os
-import spacy
+import numpy as np
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout,
+    QScrollArea, QWidget, QComboBox, QLineEdit, QPushButton, QHBoxLayout, QMessageBox
+)
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import Qt
 
-# 加载 spaCy 模型
-nlp = spacy.load("en_core_web_sm")
+def invert_rgb(arr):
+    return 255 - arr
 
-# 读取词典
-def load_vocab(filepath):
-    vocab = {}
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                parts = line.strip().split(" ", 1)
-                word = parts[0].lower()
-                vocab[word] = line.strip()
-    return vocab
+def eye_care_rgb(arr):
+    arr = arr.astype(np.float32)
+    arr[..., 0] *= 0.9   # R
+    arr[..., 1] *= 1.13  # G
+    arr[..., 2] *= 0.92  # B
+    arr = np.clip(arr, 0, 255)
+    return arr.astype(np.uint8)
 
-# 提取 PDF 文本（排除参考文献部分）
-def extract_text_before_references(pdf_path):
-    doc = fitz.open(pdf_path)
-    text = ""
-    for page in doc:
-        page_text = page.get_text()
-        if "references" in page_text.lower():
-            text += page_text.lower().split("references")[0]
-            break
-        text += page_text
-    return text
+def fitz_pix_to_qimage(pix, mode="default"):
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+    if pix.n == 4:
+        img = img[..., :3]  # Ignore alpha for mode processing
+    if mode == "night":
+        img = invert_rgb(img)
+    elif mode == "eye":
+        img = eye_care_rgb(img)
+    qimg = QImage(img.data, pix.width, pix.height, pix.width*3, QImage.Format_RGB888)
+    return qimg.copy()  # 必须copy
 
-# 英文词提取 + spaCy 词形还原
-def extract_valid_words(text, valid_words_set):
-    doc = nlp(text)
-    lemmatized = set()
-    for token in doc:
-        if token.is_alpha:
-            lemma = token.lemma_.lower()
-            if lemma in valid_words_set:
-                lemmatized.add(lemma)
-    return lemmatized
+class ContinuousPDFViewer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PyQt 连续滚动PDF阅读器")
+        self.resize(1000, 800)
+        self.pdf_doc = None
+        self.page_imgs = []
+        self.current_mode = "default"
+        self.current_viewport_width = 0  # 跟踪窗口内容区宽度
 
-# 保存翻译词
-def save_words(words, vocab, path):
-    with open(path, "w", encoding="utf-8") as f:
-        for w in sorted(words):
-            f.write(vocab[w] + "\n")
+        widget = QWidget()
+        vbox = QVBoxLayout(widget)
+        top_bar = QHBoxLayout()
+        open_btn = QPushButton("打开PDF")
+        open_btn.clicked.connect(self.open_pdf)
+        self.mode_box = QComboBox()
+        self.mode_box.addItems(["默认", "夜间", "护眼"])
+        self.mode_box.currentIndexChanged.connect(self.update_pages)
+        self.page_edit = QLineEdit()
+        self.page_edit.setPlaceholderText("跳转页码")
+        self.jump_btn = QPushButton("跳转")
+        self.jump_btn.clicked.connect(self.jump_page)
+        self.page_info = QLabel("")
+        top_bar.addWidget(open_btn)
+        top_bar.addWidget(self.mode_box)
+        top_bar.addWidget(self.page_edit)
+        top_bar.addWidget(self.jump_btn)
+        top_bar.addWidget(self.page_info)
+        top_bar.addStretch()
+        vbox.addLayout(top_bar)
 
-# 保存未知词
-def save_unknown(words, path):
-    with open(path, "w", encoding="utf-8") as f:
-        for w in sorted(words):
-            f.write(w + "\n")
+        # 滚动显示所有页面
+        self.scroll = QScrollArea(self)
+        self.inner_widget = QWidget()
+        self.inner_layout = QVBoxLayout(self.inner_widget)
+        self.inner_layout.setAlignment(Qt.AlignTop)
+        self.scroll.setWidget(self.inner_widget)
+        self.scroll.setWidgetResizable(True)
+        vbox.addWidget(self.scroll)
+        self.setCentralWidget(widget)
 
-# 保存有效词
-def save_all_valid(words, path):
-    with open(path, "w", encoding="utf-8") as f:
-        for w in sorted(words):
-            f.write(w + "\n")
-
-# 主处理流程
-def process(pdf_path, output_dir):
-    # 加载词表
-    with open("words_alpha.txt", "r", encoding="utf-8") as f:
-        valid_words = set(w.strip().lower() for w in f if w.strip())
-
-    cet4_6 = load_vocab("CET4_6_merged.txt")
-    gre_toefl = load_vocab("GRE_TOEFL_OALD8_merged.txt")
-
-    # 提取词
-    raw_text = extract_text_before_references(pdf_path)
-    valid_tokens = extract_valid_words(raw_text, valid_words)
-
-    familiar = set()
-    unfamiliar = set()
-    unknown = set()
-
-    for word in valid_tokens:
-        if word in cet4_6:
-            familiar.add(word)
-        elif word in gre_toefl:
-            unfamiliar.add(word)
-        else:
-            unknown.add(word)
-
-    # 文件名
-    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    save_words(familiar, cet4_6, os.path.join(output_dir, f"{base_name}_熟悉词.txt"))
-    save_words(unfamiliar, gre_toefl, os.path.join(output_dir, f"{base_name}_待学词.txt"))
-    save_unknown(unknown, os.path.join(output_dir, f"{base_name}_生词.txt"))
-    save_all_valid(valid_tokens, os.path.join(output_dir, f"{base_name}_有效词.txt"))
-
-    messagebox.showinfo("提取完成", f"""✅ 提取完成：
-熟悉词数：{len(familiar)}
-待学习词数：{len(unfamiliar)}
-生词数：{len(unknown)}
-有效词总数：{len(valid_tokens)}""")
-
-# ===== GUI 部分 =====
-def run_gui():
-    def select_pdf():
-        path = filedialog.askopenfilename(title="选择PDF文件", filetypes=[("PDF files", "*.pdf")])
-        if path:
-            pdf_path_var.set(path)
-
-    def select_output_dir():
-        path = filedialog.askdirectory(title="选择输出目录")
-        if path:
-            output_dir_var.set(path)
-
-    def start():
-        pdf_path = pdf_path_var.get()
-        output_dir = output_dir_var.get()
-        if not pdf_path or not output_dir:
-            messagebox.showerror("错误", "请先选择PDF文件和输出路径！")
+    def open_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择PDF", "", "PDF Files (*.pdf)")
+        if not path:
             return
-        process(pdf_path, output_dir)
+        self.pdf_doc = fitz.open(path)
+        self.page_info.setText(f"共 {self.pdf_doc.page_count} 页")
+        self.update_pages()
 
-    root = tk.Tk()
-    root.title("PDF英文单词分类提取器")
-    root.geometry("600x220")
+    def get_dynamic_zoom(self):
+        """返回让PDF横向铺满可视区的动态缩放因子。"""
+        if not self.pdf_doc:
+            return 1.0
+        # 只取第一页宽度作为参考（一般每页都一样）
+        view_w = self.scroll.viewport().width()
+        pdf_w = self.pdf_doc.load_page(0).rect.width
+        if pdf_w == 0:
+            return 1.0
+        # 留一点点边距，乘0.98
+        zoom = view_w / pdf_w * 0.98
+        return zoom
 
-    pdf_path_var = tk.StringVar()
-    output_dir_var = tk.StringVar()
+    def update_pages(self):
+        # 清理之前的
+        for i in reversed(range(self.inner_layout.count())):
+            widget = self.inner_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+        self.page_imgs = []
+        if not self.pdf_doc:
+            return
+        mode = self.mode_box.currentText()
+        zoom = self.get_dynamic_zoom()
+        for i, page in enumerate(self.pdf_doc):
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            if mode == "夜间":
+                qimg = fitz_pix_to_qimage(pix, "night")
+            elif mode == "护眼":
+                qimg = fitz_pix_to_qimage(pix, "eye")
+            else:
+                qimg = fitz_pix_to_qimage(pix, "default")
+            label = QLabel()
+            label.setPixmap(QPixmap.fromImage(qimg))
+            label.setAlignment(Qt.AlignCenter)
+            self.inner_layout.addWidget(label)
+            self.page_imgs.append(label)
+        self.page_info.setText(f"共 {self.pdf_doc.page_count} 页")
 
-    tk.Label(root, text="PDF 文件路径：").pack()
-    tk.Entry(root, textvariable=pdf_path_var, width=80).pack()
-    tk.Button(root, text="选择PDF文件", command=select_pdf).pack()
+    def jump_page(self):
+        if not self.pdf_doc:
+            return
+        try:
+            p = int(self.page_edit.text()) - 1
+            if not (0 <= p < self.pdf_doc.page_count):
+                QMessageBox.warning(self, "提示", "页码超出范围")
+                return
+            label = self.page_imgs[p]
+            self.scroll.ensureWidgetVisible(label)
+        except:
+            pass
 
-    tk.Label(root, text="输出目录：").pack()
-    tk.Entry(root, textvariable=output_dir_var, width=80).pack()
-    tk.Button(root, text="选择输出目录", command=select_output_dir).pack()
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 判断宽度有变，才重渲染，避免死循环
+        new_width = self.scroll.viewport().width()
+        if new_width != self.current_viewport_width:
+            self.current_viewport_width = new_width
+            self.update_pages()
 
-    tk.Button(root, text="开始提取", command=start, bg="lightblue").pack(pady=10)
-
-    root.mainloop()
-
-if __name__ == "__main__":
-    run_gui()
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    viewer = ContinuousPDFViewer()
+    viewer.show()
+    sys.exit(app.exec_())
