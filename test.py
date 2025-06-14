@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QScrollArea, QWidget, QComboBox, QLineEdit, QPushButton, QHBoxLayout, QMessageBox,
     QMenu, QInputDialog
 )
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QCursor
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 from PyQt5.QtCore import Qt, QRect, QTimer
 
 # -------- 图像模式处理函数 --------
@@ -15,26 +15,26 @@ def invert_rgb(arr):
 
 def eye_care_rgb(arr):
     arr = arr.astype(np.float32)
-    arr[..., 0] *= 0.9   # R
-    arr[..., 1] *= 1.13  # G
-    arr[..., 2] *= 0.92  # B
+    arr[..., 0] *= 0.9
+    arr[..., 1] *= 1.13
+    arr[..., 2] *= 0.92
     arr = np.clip(arr, 0, 255)
     return arr.astype(np.uint8)
 
 def fitz_pix_to_qimage(pix, mode="default"):
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
     if pix.n == 4:
-        img = img[..., :3]  # 忽略alpha
+        img = img[..., :3]
     if mode == "night":
         img = invert_rgb(img)
     elif mode == "eye":
         img = eye_care_rgb(img)
     qimg = QImage(img.data, pix.width, pix.height, pix.width*3, QImage.Format_RGB888)
-    return qimg.copy()  # 必须copy
+    return qimg.copy()
 
-# 支持文字级高亮+批注的页面控件
+# ---- 支持文字级高亮+批注的页面控件 ----
 class WordHighlightPDFPage(QLabel):
-    def __init__(self, page, qimg, page_idx, highlight_colors, highlight_data=None, parent=None):
+    def __init__(self, page, qimg, page_idx, highlight_colors, main_win, highlight_data=None, parent=None):
         super().__init__(parent)
         self.page = page
         self.base_qimg = qimg
@@ -49,11 +49,9 @@ class WordHighlightPDFPage(QLabel):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.context_menu)
         self.highlight_colors = highlight_colors
-
-        # 获取文字word数据，结构：[ (x0, y0, x1, y1, word, block_no, line_no, word_no) ]
         self.words = page.get_text("words")
-        # 精准高亮数据（[{words:[word元组], color:QColor, note:str}], 每次高亮后累加）
         self.highlights = highlight_data if highlight_data is not None else []
+        self.main_win = main_win  # 引用主窗口
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -88,7 +86,6 @@ class WordHighlightPDFPage(QLabel):
         super().mouseReleaseEvent(event)
 
     def is_pos_in_words(self, pos, words):
-        # 判断鼠标是否在高亮单词区域内（像素坐标）
         qimg_w, qimg_h = self.base_qimg.width(), self.base_qimg.height()
         page_rect = self.page.rect
         scale_x = qimg_w / page_rect.width
@@ -104,7 +101,6 @@ class WordHighlightPDFPage(QLabel):
         return False
 
     def context_menu(self, pos):
-        # 选区转换为实际单词块
         if self.selection_rect and self.selection_rect.width() > 5 and self.selection_rect.height() > 5:
             menu = QMenu(self)
             color_actions = []
@@ -117,7 +113,6 @@ class WordHighlightPDFPage(QLabel):
                 note, ok = QInputDialog.getText(self, "输入批注", "为高亮内容添加批注（可选）：")
                 idx = [a for a, _ in color_actions].index(action)
                 color = color_actions[idx][1]
-                # 获取落入选区的words
                 hl_words = self.get_selected_words()
                 if hl_words:
                     self.highlights.append({
@@ -129,7 +124,6 @@ class WordHighlightPDFPage(QLabel):
                 self.update()
 
     def get_selected_words(self):
-        # 将当前像素选区转换为PDF坐标，找出所有word
         if not self.selection_rect or self.selection_rect.width() < 5 or self.selection_rect.height() < 5:
             return []
         qimg_w, qimg_h = self.base_qimg.width(), self.base_qimg.height()
@@ -141,7 +135,6 @@ class WordHighlightPDFPage(QLabel):
         x2 = self.selection_rect.right() * scale_x
         y2 = self.selection_rect.bottom() * scale_y
         select_box = fitz.Rect(x1, y1, x2, y2)
-        # 选中落在选区内的word
         sel_words = [w for w in self.words if fitz.Rect(w[:4]).intersects(select_box)]
         return sel_words
 
@@ -153,7 +146,6 @@ class WordHighlightPDFPage(QLabel):
         painter = QPainter(self)
         painter.drawPixmap(0, 0, QPixmap.fromImage(self.base_qimg))
         painter.setRenderHint(QPainter.Antialiasing)
-        # 高亮所有高亮words（实际单词bbox叠加半透明色）
         qimg_w, qimg_h = self.base_qimg.width(), self.base_qimg.height()
         page_rect = self.page.rect
         scale_x = qimg_w / page_rect.width
@@ -168,24 +160,39 @@ class WordHighlightPDFPage(QLabel):
                 ry1 = int(y1 * scale_y)
                 rect = QRect(rx0, ry0, rx1 - rx0, ry1 - ry0)
                 painter.fillRect(rect, color)
-        # 当前选区虚线框
         if self.selection_rect:
             painter.setPen(QPen(Qt.red, 2, Qt.DashLine))
             painter.drawRect(self.selection_rect)
         painter.end()
 
-# 懒加载连续PDF主窗口（文字级高亮体验）
+    # ---- 支持Ctrl+滚轮缩放 ----
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier:
+            main_win = self.main_win
+            if hasattr(main_win, "user_zoom"):
+                mouse_pos = event.pos()
+                old_zoom = main_win.user_zoom
+                if event.angleDelta().y() > 0 and main_win.user_zoom < 5.0:
+                    main_win.user_zoom *= 1.15
+                elif event.angleDelta().y() < 0 and main_win.user_zoom > 0.25:
+                    main_win.user_zoom /= 1.15
+                main_win.user_zoom = max(0.25, min(5.0, main_win.user_zoom))
+                main_win.update_pages_and_keep_mouse_focus(self.page_idx, mouse_pos, old_zoom)
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+# ---- 懒加载连续PDF主窗口 ----
 class LazyPDFViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyQt 连续滚动PDF文字级高亮+懒加载阅读器")
+        self.setWindowTitle("PyQt 连续滚动PDF高亮+自适应缩放")
         self.resize(1000, 800)
         self.pdf_doc = None
-        self.loaded_pages = {}   # idx: WordHighlightPDFPage
+        self.loaded_pages = {}
         self.current_mode = "默认"
         self.current_viewport_width = 0
-        self.visible_range = (0, 0)
-        self.max_pages_mem = 10  # 缓存页面数
+        self.max_pages_mem = 10
         self.page_height_hint = 800
         self.highlight_colors = [
             ("黄色", (255, 255, 0)),
@@ -194,8 +201,8 @@ class LazyPDFViewer(QMainWindow):
             ("粉色",  (255, 160, 255)),
             ("橙色",  (255, 180, 40)),
         ]
-        # 每页的高亮和批注信息，便于持久化
         self.highlight_data_dict = {}
+        self.user_zoom = 1.0  # 用户缩放倍数
 
         widget = QWidget()
         vbox = QVBoxLayout(widget)
@@ -263,14 +270,26 @@ class LazyPDFViewer(QMainWindow):
         if not self.pdf_doc:
             return 1.0
         view_w = self.scroll.viewport().width()
+        view_h = self.scroll.viewport().height()
         pdf_w = self.pdf_doc.load_page(0).rect.width
-        if pdf_w == 0:
-            return 1.0
-        zoom = view_w / pdf_w * 0.98
-        return zoom
+        pdf_h = self.pdf_doc.load_page(0).rect.height
+        if pdf_w == 0 or pdf_h == 0:
+            return self.user_zoom
+        zoom_w = view_w / pdf_w * 0.98
+        zoom_h = view_h / pdf_h * 0.98
+        zoom = min(zoom_w, zoom_h)
+        return zoom * self.user_zoom
 
     def reload_pages(self):
         self.loaded_pages.clear()
+        for i in reversed(range(self.inner_layout.count())):
+            widget = self.inner_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+        for i in range(self.pdf_doc.page_count if self.pdf_doc else 0):
+            ph = QLabel()
+            ph.setMinimumHeight(self.page_height_hint)
+            self.inner_layout.addWidget(ph)
         self.check_visible_pages()
 
     def on_scroll(self):
@@ -291,7 +310,6 @@ class LazyPDFViewer(QMainWindow):
                     self.load_page(i)
             else:
                 if i in self.loaded_pages:
-                    # 存储高亮批注信息
                     self.highlight_data_dict[i] = self.loaded_pages[i].highlights
                     w = self.loaded_pages.pop(i)
                     w.setParent(None)
@@ -320,13 +338,39 @@ class LazyPDFViewer(QMainWindow):
         else:
             qimg = fitz_pix_to_qimage(pix, "default")
         highlight_data = self.highlight_data_dict.get(idx, [])
-        label = WordHighlightPDFPage(page, qimg, idx, self.highlight_colors, highlight_data)
-        label.setMinimumHeight(self.page_height_hint)
+        label = WordHighlightPDFPage(page, qimg, idx, self.highlight_colors, self, highlight_data)
+        label.setMinimumHeight(qimg.height())
+        label.setMaximumHeight(qimg.height())
         self.inner_layout.insertWidget(idx, label)
         ph = self.inner_layout.itemAt(idx+1).widget()
         if isinstance(ph, QLabel) and ph is not label:
             ph.setParent(None)
         self.loaded_pages[idx] = label
+
+    def update_pages_and_keep_mouse_focus(self, page_idx, mouse_pos, old_zoom):
+        """缩放后，保证鼠标指针所指内容仍然居中可见"""
+        if not self.pdf_doc:
+            return
+        old_zoom_factor = self.get_dynamic_zoom() / self.user_zoom  # 之前的缩放
+        page = self.pdf_doc.load_page(page_idx)
+        pdf_rect = page.rect
+        qimg_w_old = int(pdf_rect.width * old_zoom_factor)
+        qimg_h_old = int(pdf_rect.height * old_zoom_factor)
+        mouse_x_frac = mouse_pos.x() / max(1, qimg_w_old)
+        mouse_y_frac = mouse_pos.y() / max(1, qimg_h_old)
+        self.reload_pages()
+        label = self.loaded_pages.get(page_idx)
+        if label:
+            qimg_w_new = label.base_qimg.width()
+            qimg_h_new = label.base_qimg.height()
+            label_pos = label.pos()
+            target_x = label_pos.x() + mouse_x_frac * qimg_w_new
+            target_y = label_pos.y() + mouse_y_frac * qimg_h_new
+            viewport = self.scroll.viewport()
+            vx = max(0, int(target_x - viewport.width() / 2))
+            vy = max(0, int(target_y - viewport.height() / 2))
+            self.scroll.horizontalScrollBar().setValue(vx)
+            self.scroll.verticalScrollBar().setValue(vy)
 
     def jump_page(self):
         if not self.pdf_doc:
