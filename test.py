@@ -71,9 +71,9 @@ class WordHighlightPDFPage(QLabel):
             tip = ""
             for h in self.highlights:
                 if self.is_pos_in_words(event.pos(), h['words']):
-                    if h['note']:
-                        tip = h['note']
-                    break
+                    if h.get('note'):
+                        tip = f"批注：{h['note']}"
+                        break
             self.setToolTip(tip)
         super().mouseMoveEvent(event)
 
@@ -81,9 +81,21 @@ class WordHighlightPDFPage(QLabel):
         if event.button() == Qt.LeftButton and self.selecting:
             self.end_pos = event.pos()
             self.selection_rect = QRect(self.start_pos, self.end_pos).normalized()
+            self.add_default_highlight()
             self.selecting = False
+            self.selection_rect = None
             self.update()
         super().mouseReleaseEvent(event)
+
+    def add_default_highlight(self):
+        sel_words = self.get_selected_words()
+        if sel_words:
+            color = self.highlight_colors[0][1]
+            self.highlights.append({
+                'words': sel_words,
+                'color': QColor(*color, 80),
+                'note': "",
+            })
 
     def is_pos_in_words(self, pos, words):
         qimg_w, qimg_h = self.base_qimg.width(), self.base_qimg.height()
@@ -101,27 +113,32 @@ class WordHighlightPDFPage(QLabel):
         return False
 
     def context_menu(self, pos):
-        if self.selection_rect and self.selection_rect.width() > 5 and self.selection_rect.height() > 5:
-            menu = QMenu(self)
-            color_actions = []
-            for name, color in self.highlight_colors:
-                act = menu.addAction(f"高亮：{name}")
-                color_actions.append((act, color))
-            act_cancel = menu.addAction("取消")
-            action = menu.exec_(self.mapToGlobal(pos))
-            if action != act_cancel and action is not None:
-                note, ok = QInputDialog.getText(self, "输入批注", "为高亮内容添加批注（可选）：")
-                idx = [a for a, _ in color_actions].index(action)
-                color = color_actions[idx][1]
-                hl_words = self.get_selected_words()
-                if hl_words:
-                    self.highlights.append({
-                        'words': hl_words,
-                        'color': QColor(*color, 80),
-                        'note': note if ok and note else "",
-                    })
-                self.selection_rect = None
+        # 仅在已有高亮上右键弹菜单
+        for idx, h in enumerate(self.highlights):
+            if self.is_pos_in_words(pos, h['words']):
+                menu = QMenu(self)
+                color_actions = []
+                for name, color in self.highlight_colors:
+                    act = menu.addAction(f"更改为：{name}")
+                    color_actions.append((act, color))
+                act_note = menu.addAction("编辑批注")
+                act_del = menu.addAction("删除高亮")
+                act_cancel = menu.addAction("取消")
+                action = menu.exec_(self.mapToGlobal(pos))
+                if action == act_del:
+                    self.highlights.pop(idx)
+                elif action == act_note:
+                    note, ok = QInputDialog.getText(self, "编辑批注", "输入批注内容：", text=h.get("note", ""))
+                    if ok:
+                        self.highlights[idx]['note'] = note
+                elif action in [a for a, c in color_actions]:
+                    sel_idx = [a for a, c in color_actions].index(action)
+                    color = color_actions[sel_idx][1]
+                    self.highlights[idx]['color'] = QColor(*color, 80)
                 self.update()
+                return
+        # 不在高亮区域右键无操作
+        return
 
     def get_selected_words(self):
         if not self.selection_rect or self.selection_rect.width() < 5 or self.selection_rect.height() < 5:
@@ -165,7 +182,6 @@ class WordHighlightPDFPage(QLabel):
             painter.drawRect(self.selection_rect)
         painter.end()
 
-    # ---- 支持Ctrl+滚轮缩放 ----
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
             main_win = self.main_win
@@ -186,7 +202,7 @@ class WordHighlightPDFPage(QLabel):
 class LazyPDFViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyQt 连续滚动PDF高亮+自适应缩放")
+        self.setWindowTitle("PyQt 宽度优先PDF阅读器（高亮+自适应缩放）")
         self.resize(1000, 800)
         self.pdf_doc = None
         self.loaded_pages = {}
@@ -266,18 +282,15 @@ class LazyPDFViewer(QMainWindow):
         self.reload_pages()
         QTimer.singleShot(100, self.check_visible_pages)
 
+    # 横向铺满
     def get_dynamic_zoom(self):
         if not self.pdf_doc:
             return 1.0
         view_w = self.scroll.viewport().width()
-        view_h = self.scroll.viewport().height()
         pdf_w = self.pdf_doc.load_page(0).rect.width
-        pdf_h = self.pdf_doc.load_page(0).rect.height
-        if pdf_w == 0 or pdf_h == 0:
+        if pdf_w == 0:
             return self.user_zoom
-        zoom_w = view_w / pdf_w * 0.98
-        zoom_h = view_h / pdf_h * 0.98
-        zoom = min(zoom_w, zoom_h)
+        zoom = view_w / pdf_w * 0.98
         return zoom * self.user_zoom
 
     def reload_pages(self):
@@ -348,10 +361,9 @@ class LazyPDFViewer(QMainWindow):
         self.loaded_pages[idx] = label
 
     def update_pages_and_keep_mouse_focus(self, page_idx, mouse_pos, old_zoom):
-        """缩放后，保证鼠标指针所指内容仍然居中可见"""
         if not self.pdf_doc:
             return
-        old_zoom_factor = self.get_dynamic_zoom() / self.user_zoom  # 之前的缩放
+        old_zoom_factor = self.get_dynamic_zoom() / self.user_zoom
         page = self.pdf_doc.load_page(page_idx)
         pdf_rect = page.rect
         qimg_w_old = int(pdf_rect.width * old_zoom_factor)
