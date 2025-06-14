@@ -202,7 +202,7 @@ class WordHighlightPDFPage(QLabel):
 class LazyPDFViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyQt 宽度优先PDF阅读器（高亮+自适应缩放）")
+        self.setWindowTitle("PyQt 宽度优先PDF阅读器（高亮+自适应缩放+中央居中）")
         self.resize(1000, 800)
         self.pdf_doc = None
         self.loaded_pages = {}
@@ -276,8 +276,10 @@ class LazyPDFViewer(QMainWindow):
         pix = first_page.get_pixmap(matrix=mat, alpha=False)
         self.page_height_hint = pix.height + 16
         for i in range(self.pdf_doc.page_count):
-            ph = QLabel()
-            ph.setMinimumHeight(self.page_height_hint)
+            ph = QWidget()
+            hbox = QHBoxLayout(ph)
+            hbox.setContentsMargins(0,0,0,0)
+            hbox.addStretch()
             self.inner_layout.addWidget(ph)
         self.reload_pages()
         QTimer.singleShot(100, self.check_visible_pages)
@@ -300,8 +302,10 @@ class LazyPDFViewer(QMainWindow):
             if widget:
                 widget.setParent(None)
         for i in range(self.pdf_doc.page_count if self.pdf_doc else 0):
-            ph = QLabel()
-            ph.setMinimumHeight(self.page_height_hint)
+            ph = QWidget()
+            hbox = QHBoxLayout(ph)
+            hbox.setContentsMargins(0,0,0,0)
+            hbox.addStretch()
             self.inner_layout.addWidget(ph)
         self.check_visible_pages()
 
@@ -325,18 +329,19 @@ class LazyPDFViewer(QMainWindow):
                 if i in self.loaded_pages:
                     self.highlight_data_dict[i] = self.loaded_pages[i].highlights
                     w = self.loaded_pages.pop(i)
-                    w.setParent(None)
-                    ph = QLabel()
-                    ph.setMinimumHeight(self.page_height_hint)
-                    self.inner_layout.insertWidget(i, ph)
+                    # 只移除label，不删居中容器
+                    for child in item.widget().children():
+                        if isinstance(child, QLabel):
+                            child.setParent(None)
         while len(self.loaded_pages) > self.max_pages_mem:
             farthest = max(self.loaded_pages, key=lambda idx: abs((p_start+p_end)//2-idx))
             self.highlight_data_dict[farthest] = self.loaded_pages[farthest].highlights
             w = self.loaded_pages.pop(farthest)
-            w.setParent(None)
-            ph = QLabel()
-            ph.setMinimumHeight(self.page_height_hint)
-            self.inner_layout.insertWidget(farthest, ph)
+            for j in range(self.inner_layout.count()):
+                container = self.inner_layout.itemAt(j).widget()
+                for child in container.children():
+                    if isinstance(child, QLabel):
+                        child.setParent(None)
 
     def load_page(self, idx):
         page = self.pdf_doc.load_page(idx)
@@ -354,10 +359,14 @@ class LazyPDFViewer(QMainWindow):
         label = WordHighlightPDFPage(page, qimg, idx, self.highlight_colors, self, highlight_data)
         label.setMinimumHeight(qimg.height())
         label.setMaximumHeight(qimg.height())
-        self.inner_layout.insertWidget(idx, label)
-        ph = self.inner_layout.itemAt(idx+1).widget()
-        if isinstance(ph, QLabel) and ph is not label:
-            ph.setParent(None)
+        # --------- 居中容器 -------------
+        center_widget = QWidget()
+        hbox = QHBoxLayout(center_widget)
+        hbox.setContentsMargins(0, 0, 0, 0)
+        hbox.setAlignment(Qt.AlignHCenter)
+        hbox.addWidget(label)
+        self.inner_layout.insertWidget(idx, center_widget)
+        # --------------------------------
         self.loaded_pages[idx] = label
 
     def update_pages_and_keep_mouse_focus(self, page_idx, mouse_pos, old_zoom):
@@ -375,7 +384,14 @@ class LazyPDFViewer(QMainWindow):
         if label:
             qimg_w_new = label.base_qimg.width()
             qimg_h_new = label.base_qimg.height()
-            label_pos = label.pos()
+            # 需要找到居中容器的位置
+            for i in range(self.inner_layout.count()):
+                container = self.inner_layout.itemAt(i).widget()
+                if label in container.children():
+                    label_pos = container.pos()
+                    break
+            else:
+                label_pos = label.pos()
             target_x = label_pos.x() + mouse_x_frac * qimg_w_new
             target_y = label_pos.y() + mouse_y_frac * qimg_h_new
             viewport = self.scroll.viewport()
@@ -396,7 +412,12 @@ class LazyPDFViewer(QMainWindow):
             if not label:
                 self.load_page(p)
                 label = self.loaded_pages[p]
-            self.scroll.ensureWidgetVisible(label)
+            # 找到label的居中容器
+            for i in range(self.inner_layout.count()):
+                container = self.inner_layout.itemAt(i).widget()
+                if label in container.children():
+                    self.scroll.ensureWidgetVisible(container)
+                    break
         except:
             pass
 
