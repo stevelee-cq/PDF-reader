@@ -4,7 +4,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout,
     QScrollArea, QWidget, QComboBox, QLineEdit, QPushButton, QHBoxLayout, QMessageBox,
-    QMenu, QInputDialog
+    QMenu, QInputDialog, QTreeWidget, QTreeWidgetItem, QSplitter
 )
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 from PyQt5.QtCore import Qt, QRect, QTimer
@@ -174,7 +174,7 @@ class WordHighlightPDFPage(QLabel):
                 ry1 = int(y1 * scale_y)
                 rect = QRect(rx0, ry0, rx1 - rx0, ry1 - ry0)
                 painter.fillRect(rect, color)
-                # ----- 下划线 -----
+                # 下划线
                 if draw_underline:
                     painter.setPen(QPen(Qt.red, max(2, rect.height()//15)))
                     underline_y = ry1 - 2
@@ -203,8 +203,8 @@ class WordHighlightPDFPage(QLabel):
 class LazyPDFViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyQt 宽度优先PDF阅读器（高亮+自适应缩放+中央居中+批注下划线）")
-        self.resize(1000, 800)
+        self.setWindowTitle("PyQt PDF阅读器（高亮/批注/目录导航）")
+        self.resize(1200, 800)
         self.pdf_doc = None
         self.loaded_pages = {}
         self.current_mode = "默认"
@@ -221,8 +221,21 @@ class LazyPDFViewer(QMainWindow):
         self.highlight_data_dict = {}
         self.user_zoom = 1.0
 
-        widget = QWidget()
-        vbox = QVBoxLayout(widget)
+        # ---- UI ----
+        main_widget = QWidget()
+        main_layout = QHBoxLayout(main_widget)
+        self.splitter = QSplitter(Qt.Horizontal)
+
+        # 左侧目录树
+        self.toc_tree = QTreeWidget()
+        self.toc_tree.setHeaderHidden(True)
+        self.toc_tree.setMinimumWidth(220)
+        self.toc_tree.itemClicked.connect(self.on_toc_item_clicked)
+        self.splitter.addWidget(self.toc_tree)
+
+        # 右侧PDF内容栏
+        right_widget = QWidget()
+        vbox = QVBoxLayout(right_widget)
         top_bar = QHBoxLayout()
         open_btn = QPushButton("打开PDF")
         open_btn.clicked.connect(self.open_pdf)
@@ -252,7 +265,11 @@ class LazyPDFViewer(QMainWindow):
         self.scroll.setWidget(self.inner_widget)
         self.scroll.setWidgetResizable(True)
         vbox.addWidget(self.scroll)
-        self.setCentralWidget(widget)
+        right_widget.setLayout(vbox)
+        self.splitter.addWidget(right_widget)
+        self.splitter.setSizes([240, 900])
+        main_layout.addWidget(self.splitter)
+        self.setCentralWidget(main_widget)
 
         self.scroll.verticalScrollBar().valueChanged.connect(self.on_scroll)
         self.scroll_timer = QTimer(self)
@@ -284,7 +301,42 @@ class LazyPDFViewer(QMainWindow):
             self.inner_layout.addWidget(ph)
         self.reload_pages()
         QTimer.singleShot(100, self.check_visible_pages)
+        self.load_toc()
 
+    # --------- 目录树支持 -----------
+    def load_toc(self):
+        self.toc_tree.clear()
+        if not self.pdf_doc:
+            return
+        toc = self.pdf_doc.get_toc(simple=False)
+        if not toc:
+            root = QTreeWidgetItem(self.toc_tree, ["无目录"])
+            root.setData(0, Qt.UserRole, None)
+            self.toc_tree.addTopLevelItem(root)
+            return
+        stack = []
+        last_item = None
+        for entry in toc:
+            level, title, page, *_ = entry
+            item = QTreeWidgetItem([title])
+            item.setData(0, Qt.UserRole, page - 1)
+            if level == 1:
+                self.toc_tree.addTopLevelItem(item)
+                stack = [item]
+            else:
+                while len(stack) >= level:
+                    stack.pop()
+                stack[-1].addChild(item)
+                stack.append(item)
+            last_item = item
+
+    def on_toc_item_clicked(self, item, col):
+        page = item.data(0, Qt.UserRole)
+        if isinstance(page, int) and page >= 0:
+            self.page_edit.setText(str(page + 1))
+            self.jump_page()
+
+    # ----------- 其余功能与之前一致 ---------
     def get_dynamic_zoom(self):
         if not self.pdf_doc:
             return 1.0
